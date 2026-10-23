@@ -1,0 +1,146 @@
+name: Sync personal fork (All Branches)
+
+# Sincronización automática de todas las ramas desde upstream (craftzdog/dotfiles)
+# Basado en el estándar ADR 0024 de robert-flo/quickshell y fleet.
+#
+# Cada día a las 04:00 AM El Salvador (10:00 UTC) o bajo demanda (workflow_dispatch):
+# 1. Obtiene todas las ramas de craftzdog/dotfiles.
+# 2. Hace fast-forward o rebase automático para mantener ramas con personalizaciones (como feat/late-2026).
+# 3. En caso de conflicto de rebase, aborta de forma segura y abre un Issue para alertar.
+
+on:
+  schedule:
+    # 04:00 America/El_Salvador (UTC-6) -> 10:00 UTC
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: sync-upstream-${{ github.repository }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync-branches:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          token: ${{ secrets.FORK_SYNC_PAT || github.token }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync all branches from craftzdog/dotfiles
+        env:
+          GH_TOKEN: ${{ secrets.FORK_SYNC_PAT || github.token }}
+          UPSTREAM_REPO: "craftzdog/dotfiles"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+
+          echo "Configurando remoto upstream: https://github.com/${UPSTREAM_REPO}.git"
+          git remote add real-upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url real-upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch real-upstream
+          git fetch origin
+
+          # Obtener lista de ramas remotas de upstream (excluyendo HEAD)
+          UPSTREAM_BRANCHES=$(git branch -r | grep '^  real-upstream/' | grep -v 'HEAD' | sed 's|^  real-upstream/||')
+
+          echo "Ramas detectadas en upstream:"
+          echo "$UPSTREAM_BRANCHES"
+
+          for branch in $UPSTREAM_BRANCHES; do
+            echo ""
+            echo "=================================================="
+            echo "Sincronizando rama: $branch"
+            echo "=================================================="
+
+            # 1. Si la rama existe en origin
+            if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+              git checkout -B "$branch" "origin/$branch"
+
+              # Verificar si ya está al día
+              UPSTREAM_HASH=$(git rev-parse "real-upstream/$branch")
+              LOCAL_HASH=$(git rev-parse "origin/$branch")
+
+              if [ "$UPSTREAM_HASH" = "$LOCAL_HASH" ]; then
+                echo "Rama $branch ya está completamente al día con upstream. Saltando."
+                continue
+              fi
+
+              # Intentar Fast-Forward primero
+              if git merge --ff-only "real-upstream/$branch" 2>/dev/null; then
+                echo "Fast-Forward exitoso para $branch. Subiendo cambios..."
+                git push origin "$branch"
+              else
+                # Tiene personalizaciones locales (ej. feat/late-2026). Rebasear sobre upstream
+                echo "La rama $branch tiene commits locales personalizados. Rebaseando sobre real-upstream/$branch..."
+                if git rebase "real-upstream/$branch"; then
+                  echo "Rebase exitoso para $branch. Subiendo con force-with-lease..."
+                  git push --force-with-lease origin "$branch"
+                else
+                  echo "Conflicto detectado al rebasear $branch. Abortando rebase..."
+                  CONFLICT_FILES="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
+                  git rebase --abort
+
+                  REPO="${GITHUB_REPOSITORY}"
+                  TITLE="[Conflicto Rebase] Sincronización de $branch requiere intervención"
+                  BODY="$(cat <<EOF
+          Se detectó un conflicto al rebasear la rama \`${branch}\` sobre \`upstream/${branch}\`.
+
+          Run: ${RUN_URL}
+
+          ### Archivos en conflicto:
+          \`\`\`
+          ${CONFLICT_FILES:-"(no listados)"}
+          \`\`\`
+
+          El workflow abortó el rebase y **no** hizo force-push para proteger tus cambios.
+
+          ### Cómo resolverlo localmente:
+          \`\`\`bash
+          git fetch origin
+          git remote add upstream https://github.com/${UPSTREAM_REPO}.git 2>/dev/null || true
+          git fetch upstream ${branch}
+          git checkout ${branch}
+          git rebase upstream/${branch}
+          # Resuelve los conflictos en los archivos listados
+          git add <archivos-resueltos>
+          git rebase --continue
+          git push --force-with-lease origin ${branch}
+          \`\`\`
+          EOF
+                  )"
+
+                  OPEN_NUM="$(gh issue list -R "$REPO" --state open --limit 50 --json number,title \
+                    --jq "[.[] | select(.title | startswith(\"[Conflicto Rebase] Sincronización de $branch\"))] | .[0].number // empty")"
+
+                  if [[ -n "${OPEN_NUM}" ]]; then
+                    gh issue comment -R "$REPO" "$OPEN_NUM" --body "$BODY"
+                    echo "Actualizado issue existente #${OPEN_NUM}"
+                  else
+                    gh issue create -R "$REPO" --title "$TITLE" --body "$BODY"
+                    echo "Creado nuevo issue para alertar sobre el conflicto"
+                  fi
+                fi
+              fi
+            else
+              # 2. Si es una rama nueva que aún no está en origin
+              echo "Nueva rama detectada en upstream: $branch. Creando espejo en origin..."
+              git checkout -b "$branch" "real-upstream/$branch"
+              git push -u origin "$branch"
+            fi
+          done
+
+          echo ""
+          echo "=================================================="
+          echo "Sincronización completada con éxito."
+          echo "=================================================="
