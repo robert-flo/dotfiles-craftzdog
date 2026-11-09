@@ -1,0 +1,24 @@
+# Thin caller for ADR 0024.
+# Day-to-day work lands on `personal` via PRs. `upstream` is a fast-forward
+# mirror of craftzdog/dotfiles master. Do not push to that upstream remote.
+
+name: Sync personal fork
+
+on:
+  schedule:
+    # 04:00 America/El_Salvador (UTC-6) -> 10:00 UTC
+    - cron: "0 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    uses: robert-flo/fleet/.github/workflows/sync-personal-fork.yml@main
+    with:
+      upstream_repo: craftzdog/dotfiles
+      upstream_branch: master
+    secrets:
+      token: ${{ secrets.FORK_SYNC_PAT }}
